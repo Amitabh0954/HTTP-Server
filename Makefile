@@ -1,8 +1,8 @@
 CXX := g++
-CXXFLAGS := -std=c++17 -Wall -Wextra -g -fsanitize=address,undefined
-LDFLAGS := -fsanitize=address,undefined
+CXXFLAGS := -std=c++17 -Wall -Wextra -g -fsanitize=address,undefined -pthread
+LDFLAGS := -fsanitize=address,undefined -pthread
 
-SRCS := main.cpp Socket.cpp
+SRCS := main.cpp Socket.cpp HttpRequest.cpp HttpResponse.cpp Server.cpp ThreadPool.cpp
 OBJS := $(SRCS:.cpp=.o)
 TARGET := server
 
