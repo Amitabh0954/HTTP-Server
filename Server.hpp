@@ -1,11 +1,10 @@
 #pragma once
 
-#include "HttpResponse.hpp"
+#include "RequestHandler.hpp"
 #include "Socket.hpp"
 #include "ThreadPool.hpp"
 
 #include <cstddef>
-#include <filesystem>
 #include <string>
 
 // Listens on a TCP port and serves static files out of a document root.
@@ -26,13 +25,8 @@ private:
     // guaranteed closed exactly once, on every exit path.
     void handleClient(int client_fd);
 
-    // Resolves an HTTP request path to a file under docRoot_ and returns
-    // the response to send: 200 + file contents, 404 if it doesn't exist,
-    // or 403 if the path tries to escape docRoot_ via "..".
-    HttpResponse serveFile(const std::string& requestPath) const;
-
     int port_;
-    std::filesystem::path docRoot_; // canonical (absolute, symlink-resolved)
+    RequestHandler handler_;
     Socket listen_sock_;
     ThreadPool pool_;
 };

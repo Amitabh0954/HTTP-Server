@@ -65,3 +65,11 @@ std::optional<HttpRequest> HttpRequest::parse(const std::string& raw) {
 
     return req;
 }
+
+bool HttpRequest::keepAlive() const {
+    auto it = headers.find("connection");
+    if (it != headers.end()) {
+        return toLower(it->second) == "keep-alive";
+    }
+    return version == "HTTP/1.1";
+}

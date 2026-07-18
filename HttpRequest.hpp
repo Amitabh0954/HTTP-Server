@@ -21,4 +21,10 @@ struct HttpRequest {
     // responsible for buffering recv() until that terminator appears).
     // Returns std::nullopt if the request line itself is malformed.
     static std::optional<HttpRequest> parse(const std::string& raw);
+
+    // Whether the connection this request arrived on should stay open
+    // afterwards. HTTP/1.1 defaults to persistent connections unless told
+    // otherwise; HTTP/1.0 defaults to closing unless told otherwise -- an
+    // explicit Connection header always overrides the version's default.
+    bool keepAlive() const;
 };

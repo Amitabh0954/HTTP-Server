@@ -5,25 +5,24 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
-#include <sstream>
-#include <thread>
-#include <unordered_map>
-
-namespace fs = std::filesystem;
 
 namespace {
 
-constexpr int kBacklog = 16;
+// Sized for load-testing at high concurrency (wrk -c1000, etc). Too small
+// a backlog here causes the kernel to drop/cookie incoming SYNs under a
+// burst of simultaneous connection attempts ("SYN flooding" in dmesg) --
+// visible as client-side connect() stalls and timeouts that have nothing
+// to do with how fast this program itself responds.
+constexpr int kBacklog = 1024;
 constexpr size_t kRecvChunk = 4096;
 constexpr size_t kMaxHeaderBytes = 8192; // guards against an unbounded buffer
                                           // if a client never sends "\r\n\r\n"
@@ -80,48 +79,11 @@ bool sendAll(int fd, const std::string& data) {
     return true;
 }
 
-std::string mimeTypeFor(const std::string& extension) {
-    static const std::unordered_map<std::string, std::string> kMimeTypes = {
-        {".html", "text/html"},
-        {".htm", "text/html"},
-        {".css", "text/css"},
-        {".js", "application/javascript"},
-        {".png", "image/png"},
-        {".jpg", "image/jpeg"},
-        {".jpeg", "image/jpeg"},
-        {".ico", "image/x-icon"},
-    };
-
-    auto it = kMimeTypes.find(extension);
-    return it != kMimeTypes.end() ? it->second : "application/octet-stream";
-}
-
-HttpResponse makeErrorResponse(int code, const std::string& text) {
-    HttpResponse response(code, text);
-    response.setHeader("Content-Type", "text/plain");
-    response.setBody(text);
-    return response;
-}
-
-// Decides whether the connection should stay open after this response.
-// HTTP/1.1 defaults to persistent connections unless told otherwise;
-// HTTP/1.0 defaults to closing unless told otherwise -- an explicit
-// Connection header always overrides the version's default.
-bool wantsKeepAlive(const HttpRequest& request) {
-    auto it = request.headers.find("connection");
-    if (it != request.headers.end()) {
-        std::string value = it->second;
-        std::transform(value.begin(), value.end(), value.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        return value == "keep-alive";
-    }
-    return request.version == "HTTP/1.1";
-}
-
 } // namespace
 
 Server::Server(int port, const std::string& docRoot, size_t numThreads)
     : port_(port),
+      handler_(docRoot),
       listen_sock_(createListenSocket(port)),
       pool_(numThreads, [this](int fd) { handleClient(fd); }) {
     // Without this, writing to a socket whose peer already closed their
@@ -141,19 +103,10 @@ Server::Server(int port, const std::string& docRoot, size_t numThreads)
     // makes each printf() visible immediately regardless of where stdout
     // points.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
-
-    // Thrown deliberately (not error_code): this runs once at startup, not
-    // per-request, so a bad docRoot should fail loudly and immediately.
-    try {
-        docRoot_ = fs::canonical(docRoot);
-    } catch (const fs::filesystem_error& e) {
-        std::fprintf(stderr, "Invalid document root '%s': %s\n", docRoot.c_str(), e.what());
-        std::exit(EXIT_FAILURE);
-    }
 }
 
 void Server::run() {
-    std::printf("Listening on port %d, serving %s\n", port_, docRoot_.c_str());
+    std::printf("Listening on port %d (thread pool)\n", port_);
 
     for (;;) {
         sockaddr_in client_addr{};
@@ -165,6 +118,17 @@ void Server::run() {
             std::fprintf(stderr, "accept: %s\n", std::strerror(errno));
             continue;
         }
+
+        // Disables Nagle's algorithm. Without this, the kernel can delay
+        // transmitting a small write (like our headers, if a response
+        // ever goes out in more than one send()) hoping to coalesce it
+        // with more outgoing data -- which, combined with the peer's
+        // delayed-ACK timer, can stall a single small response by tens to
+        // hundreds of milliseconds. HTTP responses are latency-sensitive
+        // and not a stream of unrelated small writes, so we always want
+        // them sent immediately.
+        int one = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
@@ -216,13 +180,13 @@ void Server::handleClient(int client_fd) {
             return;
         }
 
+        bool keep_alive = request->keepAlive();
+
         std::printf("[%s] %s %s %s\n", request->method.c_str(),
                     request->path.c_str(), request->version.c_str(),
-                    wantsKeepAlive(*request) ? "keep-alive" : "close");
+                    keep_alive ? "keep-alive" : "close");
 
-        bool keep_alive = wantsKeepAlive(*request);
-
-        HttpResponse response = serveFile(request->path);
+        HttpResponse response = handler_.handle(request->path);
         response.setHeader("Connection", keep_alive ? "keep-alive" : "close");
 
         if (!sendAll(client_sock.fd(), response.toString())) {
@@ -234,68 +198,4 @@ void Server::handleClient(int client_fd) {
         }
         // else: loop back and read the next request off the same connection
     }
-}
-
-HttpResponse Server::serveFile(const std::string& requestPath) const {
-    // Drop a query string ("/page?x=1" -> "/page") -- we don't support
-    // query parameters yet, and leaving them on would make every request
-    // resolve to a nonexistent file.
-    std::string cleanPath = requestPath.substr(0, requestPath.find('?'));
-
-    if (cleanPath == "/") {
-        cleanPath = "/index.html";
-    }
-
-    // fs::path's operator/ DISCARDS the left-hand side entirely if the
-    // right-hand side is an absolute path (e.g. path("www") / path("/etc")
-    // == "/etc", not "www/etc"). Every HTTP path starts with '/', so we
-    // must strip that leading slash before appending onto docRoot_ --
-    // otherwise every request would silently resolve from the filesystem
-    // root instead of our document root, bypassing the traversal check
-    // entirely (it would just never trigger, not because paths are safe,
-    // but because we'd never actually be joining against docRoot_).
-    fs::path relative(cleanPath.substr(1));
-    fs::path requested = docRoot_ / relative;
-
-    // weakly_canonical resolves ".." and symlinks in whatever prefix of the
-    // path actually exists, and lexically normalizes the rest -- unlike
-    // fs::canonical, it does NOT throw/fail if the final file is missing,
-    // which is exactly what we need: we want traversal detection to work
-    // even for a path that happens not to exist.
-    std::error_code ec;
-    fs::path canonical = fs::weakly_canonical(requested, ec);
-    if (ec) {
-        return makeErrorResponse(404, "Not Found");
-    }
-
-    // Traversal guard: compare path COMPONENT BY COMPONENT, not as raw
-    // strings. A naive canonical.string().starts_with(docRoot_.string())
-    // would wrongly accept "/var/www_evil" as being "inside" "/var/www" --
-    // component comparison respects path boundaries instead of just bytes.
-    auto mismatch_pair = std::mismatch(docRoot_.begin(), docRoot_.end(),
-                                        canonical.begin(), canonical.end());
-    if (mismatch_pair.first != docRoot_.end()) {
-        std::fprintf(stderr, "Blocked traversal attempt: %s\n", requestPath.c_str());
-        return makeErrorResponse(403, "Forbidden");
-    }
-
-    if (!fs::is_regular_file(canonical, ec) || ec) {
-        return makeErrorResponse(404, "Not Found");
-    }
-
-    std::ifstream file(canonical, std::ios::binary);
-    if (!file) {
-        return makeErrorResponse(404, "Not Found");
-    }
-
-    // rdbuf() streaming reads the whole file as raw bytes -- no text-mode
-    // translation, so this is safe for binary content like PNGs, not just
-    // text files.
-    std::ostringstream contents;
-    contents << file.rdbuf();
-
-    HttpResponse response(200, "OK");
-    response.setHeader("Content-Type", mimeTypeFor(canonical.extension().string()));
-    response.setBody(contents.str());
-    return response;
 }
